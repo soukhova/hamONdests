@@ -1,0 +1,170 @@
+---
+title: "School Profiles Capacity Model"
+output: html_notebook
+---
+
+Mary coded the available school information profiles in the file `School-Profiles.csv`. The idea is to see if there is a good fit between the attributes of the school and its On the Ground capacity (OTG capacity). If we can develop a model with the information available, we could use it to estimate the OTG capacity of the schools for which we lack this information. 
+
+Begin by loading some essential packages:
+```{r message=FALSE}
+library(readr)
+library(tidyverse)
+```
+
+Read the data from the csv file:
+```{r}
+School_Profiles <- read_csv("School-Profiles.csv")
+```
+
+Summary of the data:
+```{r}
+School_Profiles %>%
+  summary()
+```
+
+The variable with OTG capacity is `capacity`. The size of the school is `Building Gross (Ft2)`. Check contents of table:
+```{r}
+head(School_Profiles)
+```
+
+Notice how some schools appear multiple times with data for multiple years. For example, Hillcrest has data for 2012, 2017, and 2022. The area and capacity are the same for the three years, but enrollment, capacity, and utilization rates are different. This is because the values of these variables are projections for the years 2017 and 2022.
+
+We are interested in capacity and area, so we will remove duplicates of these variables (we'll also rename `Building Gross (Ft2)` simply `area`):
+```{r}
+School_Profiles_u <- School_Profiles %>%
+  rename(area = `Building Gross (Ft2)`,
+         stage = `gym with stage`,
+         gyms = `Number of gyms`,
+         childcare = `Childcare Centre on site`) %>%
+  distinct(capacity, 
+           area, 
+           .keep_all = TRUE) # Keep all columns
+```
+
+Summary of the table:
+```{r}
+School_Profiles_u %>%
+  summary()
+```
+<!--
+Notice that one record is missing the area. Drop NAs:
+```{r}
+School_Profiles_u <- School_Profiles_u %>%
+  drop_na(area)
+```
+-->
+
+Create a scatterplot:
+```{r}
+ggplot(data = School_Profiles_u,
+       aes(x = area,
+           y = capacity)) +
+  geom_point()
+```
+
+Bigger schools have greater capacity, and there appears to be a strong linear relationship between these two variables. How strong? We can calculate the correlation:
+```{r}
+School_Profiles_u %>% 
+  select(capacity, 
+         area) %>%
+  cor()
+```
+
+Alternatively, estimate a regression model:
+```{r}
+OTG_fit <- lm(capacity ~ area, 
+              data = School_Profiles_u)
+summary(OTG_fit)
+```
+
+Explore other variables, but first they need to be converted to factors:
+```{r}
+junk <- School_Profiles_u %>%
+  transmute(capacity,
+         area = area/10000,
+         area2 = area^2,
+         Grades = factor(Grades, 
+                         levels = c("(JK-5)", "(JK-6)", "(JK-8)", "(6-8)", "(9-12)")),
+         jk5 = ifelse(Grades == "(JK-5)", 1, 0),
+         jk6 = ifelse(Grades == "(JK-6)", 1, 0),
+         jk8 = ifelse(Grades == "(JK-8)", 1, 0),
+         high = ifelse(Grades == "(9-12)", 1, 0),
+         rec_centre = factor(rec_centre),
+         rec_centre = replace_na(rec_centre, "No"),
+         pool = factor(pool),
+         pool = replace_na(pool, "No"),
+         gyms = replace_na(gyms, 1),
+         gym_1 = ifelse(gyms == 1, 1, 0),
+         gym_2 = ifelse(gyms == 2, 1, 0),
+         gym_3 = ifelse(gyms == 3, 1, 0),
+         gym_4 = ifelse(gyms == 4, 1, 0))
+```
+
+```{r}
+OTG_fit <- lm(capacity ~ area + jk8 + gym_2 + gym_3 + gym_4, 
+              data = junk)
+summary(OTG_fit)
+```
+
+```{r}
+OTG_fit <- lm(capacity ~ area + jk8 + gyms, 
+              data = junk)
+summary(OTG_fit)
+```
+
+```{r}
+ggplot(data = junk,
+       aes(x = area,
+           y = capacity,
+           shape = factor(gyms),
+           color = factor(jk8))) +
+  geom_point() + 
+  scale_color_manual(values = c("0" = "red", "1" = "blue")) +
+  geom_abline(intercept = OTG_fit$coefficients[1], 
+              slope = OTG_fit$coefficients[2], 
+              color = "red",
+              linetype = "dotted") +
+  geom_abline(intercept = OTG_fit$coefficients[1] + OTG_fit$coefficients[3], 
+              slope = OTG_fit$coefficients[2], 
+              color = "blue")
+```
+
+
+Notice how the intercept is not significant. This makes sense: a school with an area of zero would have an OTG capacity of zero! We can force the regression line to pass through the origin by making the intercept explicitly zero:
+```{r}
+OTG_fit <- lm(capacity ~ 0 + area, 
+              data=School_Profiles_u)
+summary(OTG_fit)
+```
+
+The model has a very high $R^2$ value, and the slope is significant. What it says is that every additional sq.ft of building increases on average the capacity by 0.0094624 students. It takes about 105.68 sq.ft of building to accommodate one student on average (or approximately an area of 3.12 m $\times$ 3.12 m). The standard error is 52.54: this means that our prediction line is on average 52.54 students off the observation.
+
+We can add the regression line to the scatterplot in this way:
+```{r}
+ggplot(data = School_Profiles_u,
+       aes(x = area,
+           y = capacity)) +
+  geom_point() + 
+  geom_abline(intercept = 0, 
+              slope = OTG_fit$coefficients[1])
+```
+
+Or, even more easily, with the `geom_smooth()` function of `ggplot2`, if we choose `lm` as the method (`geom_smooth()` will estimate a model using `lm` in the background):
+```{r}
+ggplot(data = School_Profiles_u,
+       aes(x = area,
+           y = capacity)) +
+  geom_point() + 
+  geom_smooth(formula = y ~ x,
+              method = "lm")
+```
+
+The advantage of using `geom_smooth()` is that it also calculates and plots the confidence interval of the regression line. This is very encouraging.
+
+Questions: 
+
+- Are these all the schools for which we have profiles? At least G.R. Allan and Prince Philip are missing, maybe Mary has yet to enter some additional records? 
+- Also, the fit is already quite high, but maybe other variables can help to reduce the standard error? Maybe experiment with some of the other variables, but only as long as there are no missing values (currently there are quite a few NAs). 
+
+- It would be interesting to see if there is a difference in the relationship for schools of different types: I am curious whether the relationship that we just modeled (~105 sq.ft per student) is different for, say, elementary and middle and high schools. 
+

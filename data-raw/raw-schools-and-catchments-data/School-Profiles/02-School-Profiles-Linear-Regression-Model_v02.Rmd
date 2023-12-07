@@ -1,0 +1,438 @@
+
+In this notebook we build a linear regression model based on available indep variables to predict on the ground capacity (OTGC) for all the school points. 
+
+Load essential packages:
+```{r message=FALSE}
+library(lwgeom)
+library(readr)
+library(sf)
+library(stargazer) # for quickly creating tables with model results
+library(tidyverse)
+library(units)
+library(sp)
+```
+
+#--- A) Preparing the School Profiles object and relating gross floor area to capacity
+
+Read the data from the csv file:
+```{r}
+School_Profiles <- read.csv("School-Profiles.csv")
+
+School_Profiles %>%
+  summary()
+```
+
+We are interested in capacity (for year 2011 or 2012, as those are un-projected values) and area, so we will remove duplicates of these variables (we'll also rename `Building Gross (Ft2)` simply `area`):
+```{r}
+School_Profiles_u <- School_Profiles %>%
+  rename(area = `Building.Gross..Ft2.`) %>%
+  distinct(capacity, 
+           area, 
+           .keep_all = TRUE) # Keep all columns
+```
+
+Drop a few inaccurate school records,  reformat the area column, and convert area from ft^2 to m^2 to match footprint units:
+```{r}
+School_Profiles_u <- School_Profiles_u %>%
+  drop_na(area)
+
+School_Profiles_u <- School_Profiles_u [ !(School_Profiles_u$school_name %in% "New Spencer Valley"),]
+
+School_Profiles_u <- School_Profiles_u [ !(School_Profiles_u$school_name %in% "Rockton Elementary"),]
+
+
+School_Profiles_u$area <- sub(",", "", School_Profiles_u$area) 
+School_Profiles_u$area <- as.numeric(as.character(School_Profiles_u$area))
+
+School_Profiles_u <- School_Profiles_u %>%
+    mutate(area = set_units(area, ft^2),
+         area = set_units(area, m^2))
+```
+
+Visualize area and capacity in a scatterplot:
+```{r}
+ggplot(data = School_Profiles_u %>%
+         mutate(area = drop_units(area)),
+       aes(x = area,
+           y = capacity)) +
+  geom_point()
+```
+
+Schools with larger gross floor areas have greater capacity, and there appears to be a strong linear relationship between these two variables. Now let's see how the building footprints relate to capacity. 
+
+#--- B) Importing School Points and comparing footprint to capacity (from School Profiles)
+
+Import DSB_1011_Comp (the School Points for 2010-2011 Public Schools in HWDSB):
+```{r}
+load("DSB_1011_Comp.RData")
+```
+
+Join the DSB_1011 table to the school profiles:
+```{r}
+School_Profiles_u <- School_Profiles_u %>%
+  left_join(DSB_1011_Comp, by = c("school_name" = "SCHNAME"))
+```
+
+Reformat school profiles and plot:
+```{r}
+School_Profiles_u %>%
+  mutate(area = drop_units(area),
+         footprint = drop_units(footprint)) %>%
+  ggplot() +
+    geom_point(aes(x = footprint, y = capacity), colour = 'red') +
+    geom_point(aes(x = area, y = capacity), colour = 'blue')
+```
+So the footprint vs. capacity (red) appears to have a less linear relationship (more steep) than area vs. capacity (blue).
+
+How strong is the linear relationship? We can calculate the correlation:
+```{r}
+School_Profiles_u %>%
+  select(capacity,
+         area,
+         footprint) %>%
+  drop_na() %>%
+  cor()
+```
+
+capacity - footprint, 0.86 corr coeff 
+capacity - area, 0.98 corr coeff
+
+Footprint isn't highly correlated as area but it definitely worth exploring.
+
+#--- C) Building a univariate regression model to predict On The Ground Capacity (OTGC) 
+
+Estimate a univariate regression model:
+```{r}
+OTG_fit_footprint <- lm(capacity ~ footprint, 
+              data = School_Profiles_u %>% 
+                drop_na(footprint))
+
+summary(OTG_fit_footprint)
+```
+
+Theoretically we know the intercept should be zero (OTGC=0 when footprint is 0). We force the regression line to pass through the origin. Let's compare the footprint and the area models:
+```{r}
+OTG_fit_area <- lm(capacity ~ 0 + area, 
+                            data = School_Profiles_u)
+
+OTG_fit_footprint <- lm(capacity ~ 0 + footprint, 
+                            data = School_Profiles_u %>% 
+                drop_na(footprint))
+
+stargazer::stargazer(OTG_fit_area, OTG_fit_footprint, type = "text")
+```
+
+Plot predictions:
+```{r}
+ggplot(data = School_Profiles_u %>%
+         mutate(area = drop_units(area)),
+       aes(x = area,
+           y = capacity)) +
+  geom_point() + 
+  geom_smooth(formula = y ~ 0 + x,
+              method = "lm")
+
+ggplot(data = School_Profiles_u %>%
+         mutate(footprint = drop_units(footprint)),
+       aes(x = footprint,
+           y = capacity)) +
+  geom_point() + 
+  geom_smooth(formula = y ~ 0 + x,
+              method = "lm")
+```
+
+It's clear area better predicts OTGC than footprint. As gross floor area is unavailable for all the datapoints, additional predictors will be added to the footprint predictors to try to improve accuracy and precision.
+
+#--- D) Building a multivariate regression model to predict On The Ground Capacity (OTGC) 
+
+Add potential predictor variables to the School Profiles object.
+
+First, add a 'proxy' for age of construction. Assuming schools constructed closer to the CBD (the lat-long coordinate of "King St W and James St S: (43.256684, -79.869039)) is older and further away is newer.
+```{r}
+urban_pt <- st_sfc(st_point(c(-79.869039, 43.256684)), crs=4326 )
+DSB_1011_Comp_WSG84 <- st_transform(DSB_1011_Comp, crs=4326)
+
+DSB_1011_Comp$urban.dist <- st_distance(DSB_1011_Comp_WSG84, y = urban_pt)
+
+School_Profiles_u <- left_join(School_Profiles_u,DSB_1011_Comp[, c("SCHNAME", "urban.dist")], by = c("school_name" = "SCHNAME"))
+
+School_Profiles_u$geometry.x <- NULL
+```
+
+Next add School Type and school Grade dummy variables:
+```{r}
+School_Profiles_u <- School_Profiles_u %>%
+  mutate(Type.Elementary = ifelse(Type == "Elementary" | Type == "Middle", 1, 0),
+         Type.Secondary = ifelse(Type == "Secondary", 1, 0),
+         Grades.6to8 = ifelse(Grades == "(6-8)", 1, 0), 
+         Grades.JKto5 = ifelse(Grades == "(JK-5)", 1,0),
+         Grades.JKto6 = ifelse(Grades == "(JK-6)", 1, 0),
+         Grades.JKto5_6 = ifelse(Grades == "(JK-5)" | Grades == "(JK-6)", 1,0),
+         Grades.JKto8 = ifelse(Grades == "(JK-8)", 1, 0),
+         Grades.9to12 = ifelse(Grades == "(9-12)", 1, 0))
+
+```
+
+Attempt different multi-variate regression models and decide upon this one:
+```{r}
+OTG_fit_DSB <- lm(log(capacity) ~ 0 + log(footprint) + Grades.JKto5_6 + Grades.JKto8 + Grades.6to8 + Grades.9to12 + urban.dist, 
+                            data = School_Profiles_u %>% 
+                drop_na(footprint))
+
+OTG_fit_CDSB <- lm(log(capacity) ~ 0 + log(footprint) + Type.Elementary + Type.Secondary + urban.dist, 
+                            data = School_Profiles_u %>% 
+                drop_na(footprint))
+
+stargazer::stargazer(OTG_fit_DSB,OTG_fit_CDSB, type = "text")
+```
+
+These two models have the most accurate adjusted R-Squared, lowest standard error and most significant predictors. DSB points have grade information while CDSB only have "elementary" or "secondary" denomonations, hence the two models. 
+
+Check the residuals for the models:
+```{r}
+ggplot(data.frame(e = OTG_fit_DSB$residuals, 
+                  capacity_pred = OTG_fit_DSB$fitted.values, 
+                  Grades = case_when(OTG_fit_DSB$model$Grades.JKto5_6 == 1 ~ "(JKto5_6)",
+                                     OTG_fit_DSB$model$Grades.6to8 == 1 ~ "(6to8)",
+                                     OTG_fit_DSB$model$Grades.JKto8 == 1 ~ "(JKto8)",
+                                     OTG_fit_DSB$model$Grades.9to12 == 1 ~ "(9to12)")),
+       aes(x = capacity_pred, y = e)) +
+  geom_point(aes(color = Grades)) + 
+  geom_smooth(method = "lm")
+
+ggplot(data.frame(e = OTG_fit_CDSB$residuals, 
+                  capacity_pred = OTG_fit_CDSB$fitted.values, 
+                  Grades = case_when(OTG_fit_CDSB$model$Type.Elementary == 1 ~ "ELEM",
+                                     OTG_fit_CDSB$model$Type.Secondary == 1 ~ "SEC")),
+       aes(x = capacity_pred, y = e)) +
+  geom_point(aes(color = Grades)) + 
+  geom_smooth(method = "lm")
+
+```
+Transform the predicted values back from their log transformation and plot:
+```{r}
+capacity_pred <- data.frame(capacity = exp(OTG_fit_DSB$model$`log(capacity)`), 
+                            capacity_pred = exp(OTG_fit_DSB$fitted.values))
+
+ggplot(capacity_pred,
+       aes(x = capacity, y = capacity_pred)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1)
+
+capacity_pred <- data.frame(capacity = exp(OTG_fit_CDSB$model$`log(capacity)`), 
+                            capacity_pred = exp(OTG_fit_CDSB$fitted.values))
+
+ggplot(capacity_pred,
+       aes(x = capacity, y = capacity_pred)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1)
+```
+
+#--- D) use the multivariate regression model to predict On The Ground Capacity (OTGC) 
+
+Let's populate the remaining OTGC in all four school point objects.
+
+The DSB Schools have fields corresponding to grades following this code:
+ELEM = JKto5 or JKto6 (i.e. Grades.JKto5_6)
+ELEM + MID = JKto8 (i.e. Grades.JKto8)
+MID = 6to8 -> (i.e Grades.6to8)
+HIGH = 9to12 (i.e. Grades.9to12)
+
+The CDSB Schools only have ELEM and HIGH fields. 
+
+First, import the rest of the school points:
+```{r}
+load("CDSB_1011_Comp.RData")
+load("DSB_1516_Comp.RData")
+load("CDSB_1516_Comp.RData")
+```
+
+Calculate the urban.dist field for all school points:
+```{r}
+urban_pt <- st_sfc(st_point(c(-79.869039, 43.256684)), crs=4326 )
+
+DSB_1516_Comp_WSG84 <- st_transform(DSB_1516_Comp, crs=4326)
+DSB_1516_Comp$urban.dist <- st_distance(DSB_1516_Comp_WSG84, y = urban_pt)
+
+CDSB_1011_Comp_WSG84 <- st_transform(CDSB_1011_Comp, crs=4326)
+CDSB_1011_Comp$urban.dist <- st_distance(CDSB_1011_Comp_WSG84, y = urban_pt)
+
+CDSB_1516_Comp_WSG84 <- st_transform(CDSB_1516_Comp, crs=4326)
+CDSB_1516_Comp$urban.dist <- st_distance(CDSB_1516_Comp_WSG84, y = urban_pt)
+
+```
+
+Now add dummy variables for the Grades in all four school point objects.
+
+DSB_1011_OTGC:
+```{r}
+#Fill in all the missing values with 0
+DSB_1011_Comp <- DSB_1011_Comp %>% 
+  mutate(ELEM = coalesce(ELEM, "0"),
+         MID = coalesce(MID, "0"),
+         HIGH = coalesce(HIGH, "0"))
+
+#Create dummy variables correspending to Grades
+DSB_1011_OTGC <- DSB_1011_Comp %>%
+  mutate(Grades.JKto5_6 = ifelse((ELEM == "ELEM" & MID == "0" & HIGH == "0"), 1, 0),
+         Grades.JKto8 = ifelse((ELEM == "ELEM" & MID == "MID" & HIGH == "0") | (SchoolType == "Elementary" & ELEM == "0" & MID == "0" & HIGH == "0"), 1, 0),
+         Grades.6to8 = ifelse((ELEM == "0" & MID == "MID" & HIGH == "0"), 1, 0),
+         Grades.9to12 = ifelse((ELEM == "0" & MID == "0" & HIGH == "HIGH")|(SchoolType == "Secondary" & ELEM == "0" & MID == "0" & HIGH == "0"), 1, 0))
+
+#add a field with index numbers for merging predicted OTGC 
+DSB_1011_OTGC$rowID <- 1:nrow(DSB_1011_OTGC)
+```
+
+DSB_1516_OTGC:
+```{r}
+DSB_1516_OTGC <- DSB_1516_Comp %>%
+  mutate(Grades.JKto5_6 = ifelse((Grades == "JK-5" | Grades == "JK-6"), 1, 0),
+         Grades.JKto8 = ifelse((Grades == "JK-8"|Grades == "1 to 8"), 1, 0),
+         Grades.6to8 = ifelse((Grades == "6 to 8" | Grades == "7 to 8" ), 1, 0),
+         Grades.9to12 = ifelse((Grades == "9 to 12"), 1, 0))
+
+DSB_1516_OTGC$rowID <- 1:nrow(DSB_1516_OTGC)
+```
+
+CDSB_1011_OTGC:
+```{r}
+CDSB_1011_OTGC <- CDSB_1011_Comp %>% 
+  mutate(Type.Elementary = ifelse(GRADE == "Elementary", 1, 0),
+         Type.Secondary = ifelse(GRADE == "Secondary", 1, 0))
+
+CDSB_1011_OTGC$rowID <- 1:nrow(CDSB_1011_OTGC)
+```
+
+CDSB_1516_OTGC:
+```{r}
+CDSB_1516_OTGC <- CDSB_1516_Comp %>%
+  mutate(Type.Elementary = ifelse(GRADE == "Elementary", 1, 0),
+         Type.Secondary = ifelse(GRADE == "Secondary", 1, 0))
+
+CDSB_1516_OTGC$rowID <- 1:nrow(CDSB_1516_OTGC)
+```
+
+Now predict OTGC using the two models. First, the DSB points:
+```{r}
+t <- data.frame(footprint = DSB_1011_OTGC$footprint, 
+           Grades.JKto5_6 = DSB_1011_OTGC$Grades.JKto5_6,
+           Grades.6to8 = DSB_1011_OTGC$Grades.6to8,
+           Grades.JKto8 =  DSB_1011_OTGC$Grades.JKto8,
+           Grades.9to12 = DSB_1011_OTGC$Grades.9to12,
+           urban.dist = DSB_1011_OTGC$urban.dist)
+t$urban.dist <- as.matrix(t$urban.dist)
+
+t2 <- predict(OTG_fit_DSB, newdata = t)
+t2 <- data.frame(Cap.Output = t2,
+                 OTGC = exp(t2))
+t2$rowID <- 1:nrow(t2)
+
+DSB_1011_OTGC <- merge(DSB_1011_OTGC, t2, by= "rowID")
+```
+
+Now add in the available OTGC and a dummy variable indicating the OTGC source (SIP or will be predicted):
+```{r}
+School_Profiles_u_select <- School_Profiles_u %>%
+  select(school_name, capacity)
+
+DSB_1011_OTGC <- DSB_1011_OTGC %>%
+  left_join(School_Profiles_u_select, by = c("SCHNAME" = "school_name" ))
+```
+
+The predicted OTGC is similar enough to the capacities from the School Information Profiles, great!
+
+Let's do the rest of the school points. 
+
+DSB_1516:
+```{r}
+t <- data.frame(footprint = DSB_1516_OTGC$footprint, 
+           Grades.JKto5_6 = DSB_1516_OTGC$Grades.JKto5_6,
+           Grades.6to8 = DSB_1516_OTGC$Grades.6to8,
+           Grades.JKto8 =  DSB_1516_OTGC$Grades.JKto8,
+           Grades.9to12 = DSB_1516_OTGC$Grades.9to12,
+           urban.dist = DSB_1516_OTGC$urban.dist)
+
+t$urban.dist <- as.matrix(t$urban.dist)
+
+t2 <- predict(OTG_fit_DSB, newdata = t)
+t2 <- data.frame(Cap.Output = t2,
+                 OTGC = exp(t2))
+t2$rowID <- 1:nrow(t2)
+
+DSB_1516_OTGC <- merge(DSB_1516_OTGC, t2, by= "rowID")
+```
+
+CDSB_1011:
+```{r}
+t <- data.frame(footprint = CDSB_1011_OTGC$footprint, 
+           Type.Elementary =  CDSB_1011_OTGC$Type.Elementary,
+           Type.Secondary = CDSB_1011_OTGC$Type.Secondary,
+           urban.dist = CDSB_1011_OTGC$urban.dist)
+
+t$urban.dist <- as.matrix(t$urban.dist)
+
+t2 <- predict(OTG_fit_CDSB, newdata = t)
+
+t2 <- data.frame(Cap.Output = t2,
+                 OTGC = exp(t2))
+t2$rowID <- 1:nrow(t2)
+
+CDSB_1011_OTGC <- merge(CDSB_1011_OTGC, t2, by= "rowID")
+```
+
+CDSB_1516:
+```{r}
+t <- data.frame(footprint = CDSB_1516_OTGC$footprint, 
+           Type.Elementary =  CDSB_1516_OTGC$Type.Elementary,
+           Type.Secondary = CDSB_1516_OTGC$Type.Secondary,
+           urban.dist = CDSB_1516_OTGC$urban.dist)
+
+t$urban.dist <- as.matrix(t$urban.dist)
+
+t2 <- predict(OTG_fit_CDSB, newdata = t)
+
+t2 <- data.frame(Cap.Output = t2,
+                 OTGC = exp(t2))
+t2$rowID <- 1:nrow(t2)
+
+CDSB_1516_OTGC <- merge(CDSB_1516_OTGC, t2, by= "rowID")
+```
+
+#--- E) Create unique ID for each school point and save as .RData
+
+```{r}
+DSB_1011_OTGC <- DSB_1011_OTGC %>%
+  select("SchoolID","CatchID","SCHNAME", "X", "Y", "SchoolType", "ELEM", "MID", "HIGH","footprint", "urban.dist", "Grades.JKto5_6", "Grades.JKto8", "Grades.6to8", "Grades.9to12", "OTGC", "geometry" )
+
+head(as.data.frame(DSB_1011_OTGC))
+
+DSB_1516_OTGC <- DSB_1516_OTGC %>%
+  select("SchoolID","CatchID","SCHNAME", "X", "Y", "SchoolTy_1", "ELEM", "MID", "HIGH","footprint", "urban.dist", "Grades.JKto5_6", "Grades.JKto8", "Grades.6to8", "Grades.9to12", "OTGC", "geometry" ) %>%
+  rename(SchoolType = "SchoolTy_1")
+
+head(as.data.frame(DSB_1516_OTGC))
+```
+
+```{r}
+CDSB_1011_OTGC <- CDSB_1011_OTGC %>%
+  select("SFIS_Num","CatchID","NAME", "X", "Y", "GRADE", "FRENCH", "ELEM", "HIGH","footprint", "urban.dist", "Type.Elementary", "Type.Secondary", "OTGC", "geometry" )%>%
+  rename(SCHNAME = "NAME", SchoolType = "GRADE")
+
+head(as.data.frame(CDSB_1011_OTGC))
+
+CDSB_1516_OTGC <- CDSB_1516_OTGC %>%
+  select("SFIS_Num","CatchID","NAME", "X", "Y", "GRADE", "FRENCH", "ELEM", "HIGH","footprint", "urban.dist", "Type.Elementary", "Type.Secondary", "OTGC", "geometry" )%>%
+  rename(SCHNAME = "NAME", SchoolType = "GRADE")
+
+head(as.data.frame(CDSB_1516_OTGC))
+```
+
+Save as .RData:
+```{r}
+saveRDS(DSB_1011_OTGC, "DSB_1011_OTGC.RData")
+saveRDS(CDSB_1011_OTGC, "CDSB_1011_OTGC.RData")
+
+saveRDS(DSB_1516_OTGC, "DSB_1516_OTGC.RData")
+saveRDS(CDSB_1516_OTGC, "CDSB_1516_OTGC.RData")
+```
+

@@ -1,0 +1,904 @@
+---
+title: "School Profiles Capacity Model_v01"
+output: html_notebook
+---
+Here I continue the work (from the original version of the.rmd) on estimating On the Ground Capacity (OTGC). If we can develop a model using the footprint data (note: gross floor area and OTGC are highly correlated and lienear), we could use it to estimate the OTG capacity of all the schools! 
+
+First begin by loading some essential packages:
+```{r message=FALSE}
+library(lwgeom)
+library(readr)
+library(sf)
+library(stargazer) # for quickly creating tables with model results
+library(tidyverse)
+library(units)
+```
+
+Read the data from the csv file:
+```{r}
+School_Profiles <- read.csv("School-Profiles.csv")
+```
+
+Summary of the data:
+```{r}
+School_Profiles %>%
+  summary()
+```
+
+The variable with OTG capacity is `capacity`. The size of the school is `Building Gross (Ft2)`. Check contents of table:
+```{r}
+head(School_Profiles)
+```
+
+Notice how some schools appear multiple times with data for multiple years. For example, Hillcrest has data for 2012, 2017, and 2022. The area and capacity are the same for the three years, but enrollment, capacity, and utilization rates are different. This is because the values of these variables are projections for the years 2017 and 2022.
+
+We are interested in capacity and area, so we will remove duplicates of these variables (we'll also rename `Building Gross (Ft2)` simply `area` and convert to sq.m):
+```{r}
+School_Profiles_u <- School_Profiles %>%
+  rename(area = `Building.Gross..Ft2.`) %>%
+  distinct(capacity, 
+           area, 
+           .keep_all = TRUE) # Keep all columns
+```
+
+Summary of the table:
+```{r}
+School_Profiles_u %>%
+  summary()
+```
+
+Now, drop a few inaccurate school records, reformat the area column, and convert area from ft2 to m2:
+```{r}
+School_Profiles_u <- School_Profiles_u %>%
+  drop_na(area)
+School_Profiles_u <- School_Profiles_u [ !(School_Profiles_u$school_name %in% "New Spencer Valley"),]
+School_Profiles_u <- School_Profiles_u [ !(School_Profiles_u$school_name %in% "Rockton Elementary"),]
+School_Profiles_u$area <- sub(",", "", School_Profiles_u$area) 
+School_Profiles_u$area <- as.numeric(as.character(School_Profiles_u$area))
+School_Profiles_u <- School_Profiles_u %>%
+    mutate(area = set_units(area, ft^2),
+         area = set_units(area, m^2))
+```
+
+
+Create a scatterplot:
+```{r}
+ggplot(data = School_Profiles_u %>%
+         mutate(area = drop_units(area)),
+       aes(x = area,
+           y = capacity)) +
+  geom_point()
+```
+
+Schools with larger gross floor areas have greater capacity, and there appears to be a strong linear relationship between these two variables. Now let's see how the building footprints (joined and digitized in Importing-GIS-Files. Rmd) relate to capacity. 
+ 
+First we import the .RData (found in the main Accessibility-to-Schools-Hamilton-Equity folder)
+```{r}
+load("DSB_1011_Comp.RData")
+#load("CDSB_1011_Comp.RData")
+#load("DSB_1516_Comp.RData")
+#load("CDSB_1516_Comp.RData")
+```
+
+<!--Next merge the 2011/2012 School-Profiles_u with DSB_1011:
+```{r}
+DSB_1011_Comp_u <- merge(DSB_1011_Comp, School_Profiles_u, by.x=c("SCHNAME"), by.y=c("school_name"), all.x = TRUE, all.y = TRUE)
+```
+-->
+
+Next join the DSB_1011 table to the school profiles:
+```{r}
+School_Profiles_u <- School_Profiles_u %>%
+  left_join(DSB_1011_Comp, by = c("school_name" = "SCHNAME"))
+```
+
+Summary of table:
+```{r}
+summary(School_Profiles_u)
+```
+
+There is 1 missing footprint values.
+
+<!--Include only 2011/2012 schools with footprints and capacities (n=42) and created comparative scatterplots:
+```{r}
+DSB_1011_Comp_u %>% 
+  drop_na(footprint)%>%
+  drop_na(capacity)%>%
+  count()
+```
+-->
+
+```{r}
+#DSB_1011_Comp_u %>% 
+School_Profiles_u %>%
+  mutate(area = drop_units(area),
+         footprint = drop_units(footprint)) %>%
+  #drop_na(footprint) %>%
+  #drop_na(capacity) %>%
+  ggplot() +
+    geom_point(aes(x = footprint, y = capacity), colour = 'red') +
+    geom_point(aes(x = area, y = capacity), colour = 'blue')
+```
+
+So the footprint vs. capacity (red) appears to have a less linear relationship (more steep) than area vs. capacity (blue). The relationship make sense: 
+1) it is weaker because a footprint is a less precise 2D representation of area which doesn't account for number and size of elevations and,
+2) it is more steep because a school with the X footprint is likely to have a higher OTGC than a school with X gross floor area (i.e. schools are generally more than 1 elevation)
+
+How strong is the linear relationship? We can calculate the correlation:
+```{r}
+School_Profiles_u %>%
+  select(capacity,
+         area,
+         footprint) %>%
+  drop_na() %>%
+  cor()
+```
+
+capacity - footprint, 0.86 corr coeff 
+capacity - area, 0.98 corr coeff
+
+So... footprint isn't highly correlated but it definitely worth exploring.
+
+Alternatively, estimate a regression model:
+```{r}
+OTG_fit_footprint <- lm(capacity ~ footprint, 
+              data = School_Profiles_u %>% 
+                drop_na(footprint))
+summary(OTG_fit_footprint)
+```
+So now, with all the school profiles fully populated - notice how the intercept is significant in the footprint model. Meaning... a school with a zero footprint would have an OTG capacity that was 149.7 student capacity... That doesn't make too much sense but theoretically we know 0 OTGC = 0 footprint so let's go with that.  
+
+We can force the regression line to pass through the origin by making the intercept explicitly zero. Let's compare the footprint and the area models:
+```{r}
+OTG_fit_area <- lm(capacity ~ 0 + area, 
+                            data = School_Profiles_u)
+OTG_fit_footprint <- lm(capacity ~ 0 + footprint, 
+                            data = School_Profiles_u %>% 
+                drop_na(footprint))
+stargazer::stargazer(OTG_fit_area, OTG_fit_footprint, type = "text")
+```
+
+The footprint has a $R^2$ value of .90 (lower than from area model but still great!), and the slope is significant. What it says is that every additional m2 of building increases on average the capacity by 0.121450 students. It takes about 8.23 m2 of footprint to accommodate one student on average (or approximately an area of 2.87*2.87 m ... this is compared to the average gross floor area of 3.57 m2 per student from the area model). The standard error is 244.1: this means that our prediction line is on average 244.1 students off the observation (compared to 111.6 students from the gross floor area model)
+
+We can add the regression line to the scatterplot in this way:
+```{r}
+#ggplot(data = School_Profiles_u,
+#       aes(x = area,
+#           y = capacity)) +
+#  geom_point() + 
+#  geom_abline(intercept = 0, 
+#              slope = OTG_fit_footprint$coefficients[1])
+School_Profiles_u %>% 
+  drop_na(footprint) %>%
+  drop_na(capacity) %>%
+  ggplot() +
+    geom_point(aes(x = as.numeric(footprint),y = capacity), colour = 'red') +
+  geom_abline(intercept = 0, 
+              slope = OTG_fit_footprint$coefficients[1])
+```
+
+Or, even more easily, with the `geom_smooth()` function of `ggplot2`, if we choose `lm` as the method (`geom_smooth()` will estimate a model using `lm` in the background):
+```{r}
+ggplot(data = School_Profiles_u %>%
+         mutate(area = drop_units(area)),
+       aes(x = area,
+           y = capacity)) +
+  geom_point() + 
+  geom_smooth(formula = y ~ 0 + x,
+              method = "lm")
+ggplot(data = School_Profiles_u %>%
+         mutate(footprint = drop_units(footprint)),
+       aes(x = footprint,
+           y = capacity)) +
+  geom_point(aes(color = Grades)) + 
+  geom_smooth(formula = y ~ 0 + x,
+              method = "lm")
+```
+
+So the Footprint model (compared to the area model) with all the schools looks pretty good. The CI appears to be about +/- 75 students at any given m2 (equal to about 3 at-capacity classrooms) which isn't too bad :/ 
+
+Convert Type to dummy variables:
+```{r}
+School_Profiles_u <- School_Profiles_u %>%
+  mutate(Type.Elementary = ifelse(Type == "Elementary", 1, 0),
+         Type.Secondary = ifelse(Type == "Secondary", 1, 0),
+         Grades.6to8 = ifelse(Grades == "(6-8)", 1, 0), #added this one
+         Grades.JKto5 = ifelse(Grades == "(JK-5)", 1,0), #and this one
+         Grades.JKto6 = ifelse(Grades == "(JK-6)", 1, 0),
+         Grades.JKto8 = ifelse(Grades == "(JK-8)", 1, 0),
+         Grades.9to12 = ifelse(Grades == "(9-12)", 1, 0))
+```
+
+Also add this one:
+```{r}
+School_Profiles_u <- School_Profiles_u %>%
+  mutate(Grades.JKto5_6 = ifelse(Grades == "(JK-5)" | Grades == "(JK-6)", 1,0))
+```
+
+
+The two clusters are ELEM/MID schools (lower footprints) and HIGH schools (larger footprints). This is discussed below:
+
+#---
+Questions asked in v00, addressed! 
+
+- Are these all the schools for which we have profiles? At least G.R. Allan and Prince Philip are missing, maybe Mary has yet to enter some additional records? 
+
+answer: yes, all of them are included now.
+
+- Also, the fit is already quite high, but maybe other variables can help to reduce the standard error? Maybe experiment with some of the other variables, but only as long as there are no missing values (currently there are quite a few NAs). 
+
+answer: I don't believe this is necessary. As we're trying to predict Capacity and the only thing consistently available is footprint for all schools - no use in improving accuracry with variables we don't have access to for all schools.
+
+- It would be interesting to see if there is a difference in the relationship for schools of different types: I am curious whether the relationship that we just modeled is different for, say, elementary and middle and high schools. 
+
+answer: so let's try this geom_smooth for ELEM, MID, and HIGH schools (and let's try it for the 2017 year capacities and 2015 footprints)
+
+#---
+Here, let's try just ELEM, MID, and HIGH using 2011/2012 capacities and 2010/2011 footprints. We are forcing through 0 intercept... otherwise negative slopes occur... 
+
+so let's try the model for HIGH (n=13) and ELEM (n=26) schools. *note a few schools are MID only, so those are not included
+<!--
+```{r}
+OTG_fit_footprint_HIGH <- lm(capacity ~ 0 + footprint, 
+              data=DSB_1011_Comp_u %>% 
+                drop_na(footprint) %>%
+                drop_na(capacity)%>%
+                drop_na(HIGH))
+OTG_fit_footprint_ELEM <- lm(capacity ~ 0 + footprint, 
+              data=DSB_1011_Comp_u %>% 
+                drop_na(footprint) %>%
+                drop_na(capacity)%>%
+                drop_na(ELEM))
+summary(OTG_fit_footprint_HIGH)
+summary(OTG_fit_footprint_ELEM)
+```
+Ah.. so an R^2 of 0.78 for ELEM and 0.94 for HIGH.  I suspect that that ELEM schools have higher elevations and, as such, OTGC varies more per footprint.
+Additionally, the HIGH footprint coeff suggests on average 1 m2 increase is 0.12 students or 1/.12 = 8.33m2 per student. For ELEM, on average 1/.14= 7.14m2 per student.
+Let's visualize the linear relationships (forcing through 0 intercept as this theoretically makes sense)
+ELEM:
+```{r}
+t <- DSB_1011_Comp_u %>% #I will finally write this to a variable
+  drop_na(footprint) %>%
+  drop_na(capacity) %>%
+  drop_na(ELEM)
+ggplot(data = t,
+       aes(x = area,
+           y = capacity)) +
+  geom_point() + 
+  geom_smooth(formula = y ~ 0 + x,
+              method = "lm")
+ggplot(data = t,
+       aes(x = footprint,
+           y = capacity)) +
+  geom_point() + 
+  geom_smooth(formula = y ~ 0 + x,
+              method = "lm")
+```
+Next MID:
+```{r}
+t <- DSB_1011_Comp_u %>%   
+  drop_na(footprint) %>%
+  drop_na(capacity) %>%
+  drop_na(MID)
+ggplot(data = t,
+       aes(x = area,
+           y = capacity)) +
+  geom_point() + 
+  geom_smooth(formula = y ~ 0 + x,
+              method = "lm")
+ggplot(data = t,
+       aes(x = footprint,
+           y = capacity)) +
+  geom_point() + 
+  geom_smooth(formula = y ~ 0 + x,
+              method = "lm")
+```
+Next HIGH:
+```{r}
+t <- DSB_1011_Comp_u %>% 
+  drop_na(footprint) %>%
+  drop_na(capacity) %>%
+  drop_na(HIGH)
+ggplot(data = t,
+       aes(x = area,
+           y = capacity)) +
+  geom_point() + 
+  geom_smooth(formula = y ~ 0 + x,
+              method = "lm")
+ggplot(data = t,
+       aes(x = footprint,
+           y = capacity)) +
+  geom_point() + 
+  geom_smooth(formula = y ~ 0 + x,
+              method = "lm")
+```
+Eep! Visually, footprint is not looking so good compared to gross floor area. Highschool footprints appear to have the strongest linear relationship. Again, I suspect this is because the schools are larger (less relative digitization error perhaps?). Maybe they are also  more uniformly constructed compared ELEM or MID (they are more new than ELEM or MIDS?) and they are likely to have fewer elevations.
+Let's see all the schools relationships for 2017 OTGC vs. Footprint compared to vs. Gross Area. 
+```{r}
+#creating new School_Profiles
+School_Profiles_u17 <- School_Profiles %>%
+  rename(area = `Building.Gross..Ft2.`)
+School_Profiles_u17 <- School_Profiles_u17[School_Profiles_u17$year == "2017", ]
+School_Profiles_u17$area <- sub(",", "", School_Profiles_u17$area) 
+School_Profiles_u17area <- as.numeric(as.character(School_Profiles_u17$area))
+School_Profiles_u17$area <- conv_unit(as.numeric(School_Profiles_u17$area), from = "ft2", to ="m2")
+```
+Deleting schools which closed after June 2015 (no 2015-2016 academic year):
+```{r}
+School_Profiles_u17 <- School_Profiles_u17 [ !(School_Profiles_u17$school_name %in% "Bell-Stone"),]
+School_Profiles_u17 <- School_Profiles_u17 [ !(School_Profiles_u17$school_name %in% "Cardinal Heights"),]
+School_Profiles_u17 <- School_Profiles_u17 [ !(School_Profiles_u17$school_name %in% "Eastmount Park"),]
+School_Profiles_u17 <- School_Profiles_u17 [ !(School_Profiles_u17$school_name %in% "Linden Park"),]
+School_Profiles_u17 <- School_Profiles_u17 [ !(School_Profiles_u17$school_name %in% "Roxborough Park"),]
+School_Profiles_u17 <- School_Profiles_u17 [ !(School_Profiles_u17$school_name %in% "Woodward"),]
+```
+Merging with DSB_1516_Comp and count elements (n=16)
+```{r}
+DSB_1516_Comp_u17 <- merge(DSB_1516_Comp, School_Profiles_u17, by.x=c("SCHNAME"), by.y=c("school_name"), all.x = TRUE, all.y = TRUE)
+data.frame(DSB_1516_Comp_u17) %>% 
+  drop_na(footprint)%>%
+  drop_na(capacity)%>%
+  count()
+```
+Include only 2017 schools with footprints and capacities (n=16) and created comparative scatterplots:
+```{r}
+DSB_1516_Comp_u17 %>% 
+  drop_na(footprint) %>%
+  drop_na(capacity) %>%
+  ggplot() +
+    geom_point(aes(x = as.numeric(footprint),y = capacity), colour = 'red') +
+    geom_point(aes(x = area,y = capacity), colour = 'blue')
+```
+So the footprint vs. capacity (red) appears to have a much less linear relationship than area vs. capacity (blue). 
+How strong is the linear relationship? We can calculate the correlation:
+```{r}
+data.frame(DSB_1516_Comp_u17) %>% 
+  drop_na(footprint) %>%
+  drop_na(capacity) %>%
+  select(capacity, area, footprint) %>%
+  cor()
+```
+```{r}
+data.frame(DSB_1516_Comp_u17) %>% 
+  drop_na(footprint)%>%
+  drop_na(capacity)%>%
+  drop_na(ELEM)%>%
+  count()
+```
+Hmm.. so a .311 correlation for Footprint and OTGC. This sort of makes sense relative to the 2011/2012 ELEM capacities which showed a weaker linear relationship compared to HIGH schools. As you can see, all 16 schools in the sample are ELEM or MID. The school profiles did not have information for secondary schools. 
+Additionally, the OTGC values used in 2017 are *forecasted* so I didn't expect a similar strength in relationship. I guess that's good news..
+*Next step questions:*
+1) - Do you think the OTGC vs. footprint model generated from all 2011-2012 school profiles capacities is sufficient ? If yes, what statistics should be reported in addition to R^2, standard error, coefficients, and confidence intervals...
+2) - If you believe it's not sufficent... (the 2017 OTGC sample we have does not show a strong relationship with footprint) what other information do you think can be gleaned from Google Maps for the other schools? Not sure if building.levels would be tell us anything as we cannot test the relationship... see below: 
+```{r}
+data.frame(DSB_1516_Comp_u17) %>% 
+  drop_na(area) %>%
+  drop_na(building.levels) %>%
+  count()
+```
+there is only one 2017 school with a Building.Level (populated from the OSM footprints) and capacity/area/all other school profile information.
+Additionally, of the schools with building level info, the footprint and building.levels are not highly correlated.
+```{r}
+t <- data.frame(DSB_1516_Comp_u17) %>% 
+  drop_na(building.levels) %>%
+  drop_na(footprint)
+t$building.levels <- as.numeric(t$building.levels)
+t %>%
+  select(building.levels, footprint) %>%
+  cor()
+```
+Other variables which add to Gross Floor Area such as Gyms, etc.. require a floorplan. Floorplans are not available for all schools, esp. for the specific years we are looking for.
+3) - I found some extra 2010-2011 schools which the original GIS points do not include... How complete is the original GIS points? Is it worth going through the point data and revising?
+-->
+
+## Further experiments with model
+
+Introduce the type of school into the regression. This variable is readily available:
+```{r}
+OTG_fit_footprint <- lm(capacity ~ 0 + footprint + Type.Elementary + Type.Secondary, 
+                            data = School_Profiles_u %>% 
+                drop_na(footprint))
+summary(OTG_fit_footprint)
+```
+
+This improves the results quite a bit, from approx. $R_{adj}^2=0.9135$ to $R^2=0.9414$ and the standard error is smaller.
+
+
+Check residuals and pseudo-R2 of this model:
+```{r}
+ggplot(data.frame(capacity = OTG_fit_footprint$residuals, 
+                  capacity_pred = OTG_fit_footprint$fitted.values, 
+                  SchoolType = case_when(OTG_fit_footprint$model$Type.Elementary == 1 ~ "Elementary",
+                                     OTG_fit_footprint$model$Type.Secondary == 1 ~ "Secondary")),
+       aes(x = capacity_pred, y = capacity)) +
+  geom_point(aes(color = SchoolType)) + 
+  geom_smooth(method = "lm")
+#squaring the correlation between predicted and actual capacity
+(cor(data.frame(capacity = OTG_fit_footprint$model$capacity,  
+           capacity_pred =OTG_fit_footprint$fitted.values)))^2
+```
+
+Hmm. maybe a variable transformation can address the unhealthy looking residual plot, lets try:
+```{r}
+OTG_fit_footprint_t <- lm(log10(capacity) ~ 0 + log10(footprint) + Type.Elementary + Type.Secondary, data = School_Profiles_u %>% 
+                drop_na(footprint))
+summary(OTG_fit_footprint_t)
+#check residuals
+ggplot(data.frame(log10 = OTG_fit_footprint_t$residuals, 
+                  capacity_pred = OTG_fit_footprint_t$fitted.values, 
+                  SchoolType = case_when(OTG_fit_footprint_t$model$Type.Elementary == 1 ~ "Elementary",
+                                         OTG_fit_footprint_t$model$Type.Secondary == 1 ~ "Secondary")),
+       aes(x = capacity_pred, y = log10)) +
+  geom_point(aes(color = SchoolType)) + 
+  geom_smooth(method = "lm")
+```
+
+So... helped a bit but this suggests variables are missing. 
+
+#-------------
+
+Instead of type of school, use the grades:
+```{r}
+#OTG_fit_footprint_g <- lm(capacity ~ 0 + footprint + Grades.JKto6 + Grades.JKto8 + Grades.9to12, 
+#                          data = School_Profiles_u %>% 
+#                          drop_na(footprint))
+#summary(OTG_fit_footprint_g)
+#Here I realized not all Grades dummy fields are populated. I added in the rest of the Grade combinations. 
+```
+
+
+```{r}
+OTG_fit_footprint_g <- lm(capacity ~ 0 + footprint + Grades.6to8 + Grades.JKto5 + Grades.JKto6 + Grades.JKto8 + Grades.9to12, 
+                          data = School_Profiles_u %>% 
+                          drop_na(footprint))
+summary(OTG_fit_footprint_g)
+```
+
+This is a little bit better even than type of school with a smaller standard error too. Remove non-significant variables (6to8,and jkto6):
+```{r}
+OTG_fit_footprint_g <- lm(capacity ~ 0 + footprint + Grades.JKto8 + Grades.JKto5 + Grades.9to12, 
+                            data = School_Profiles_u %>% 
+                drop_na(footprint))
+summary(OTG_fit_footprint_g)
+```
+
+Plot and label point:
+```{r}
+data.frame(capacity = OTG_fit_footprint_g$model$capacity, 
+           capacity_pred =OTG_fit_footprint_g$fitted.values) %>%
+  ggplot(aes(x = capacity, y = capacity_pred,
+             label=sprintf("%0.0f", OTG_fit_footprint_g$model$footprint))) +
+  geom_point() +
+  geom_text(size = 3, hjust=0.5, vjust=-0.5) +
+  geom_abline(intercept = 0, slope = 1)
+```
+
+Pseudo-R^2:
+```{r}
+(cor(data.frame(capacity = OTG_fit_footprint_g$model$capacity, 
+           capacity_pred =OTG_fit_footprint_g$fitted.values)))^2
+```
+
+Check the residuals of the last model:
+```{r}
+ggplot(data.frame(residuals = OTG_fit_footprint_g$residuals, 
+                  capacity_pred = OTG_fit_footprint_g$fitted.values,
+                  Grades = case_when(OTG_fit_footprint_g$model$Grades.JKto5 == 1 ~ "(JKto5)",
+                  OTG_fit_footprint_g$model$Grades.JKto8 == 1 ~ "(JKto8)",
+                  OTG_fit_footprint_g$model$Grades.9to12 == 1 ~ "(9to12)")),
+       aes(x = capacity_pred, y = residuals)) +
+         geom_point(aes(color = Grades)) + 
+         geom_smooth(method = "lm")
+# OTG_fit_footprint_g$model$Grades.JKto6 == 1 ~ #"(JKto6)",
+# Grades = #case_when(OTG_fit_footprint_g$model$Grades.6to8 == 1 ~ "(6to8)",
+```
+
+There might be some heteroskedacity. Try a variable transformation:
+```{r}
+OTG_fit_footprint_gt <- lm(log(capacity) ~ 0 + log(footprint) + Grades.JKto5 + Grades.JKto8 + Grades.9to12, 
+                            data = School_Profiles_u %>% 
+                drop_na(footprint))
+summary(OTG_fit_footprint_gt)
+#Grades.6to8
+#Grades.JKto6
+```
+
+Check the residuals of the last model:
+```{r}
+ggplot(data.frame(e = OTG_fit_footprint_gt$residuals, 
+                  capacity_pred = OTG_fit_footprint_gt$fitted.values, 
+                  Grades = case_when(OTG_fit_footprint_g$model$Grades.JKto5 == 1 ~ "(JKto5)",
+                                     OTG_fit_footprint_g$model$Grades.JKto8 == 1 ~ "(JKto8)",
+                                     OTG_fit_footprint_g$model$Grades.9to12 == 1 ~ "(9to12)")),
+       aes(x = capacity_pred, y = e)) +
+  geom_point(aes(color = Grades)) + 
+  geom_smooth(method = "lm")
+#OTG_fit_footprint_g$model$Grades.JKto6 == 1 ~ "(JKto6)",
+#OTG_fit_footprint_g$model$Grades.6to8 == 1 ~ "(6to8)",
+```
+
+Transform the predicted values back from their log transformation and check pseudo-R2:
+```{r}
+capacity_pred <- data.frame(capacity = exp(OTG_fit_footprint_gt$model$`log(capacity)`), 
+                            capacity_pred = exp(OTG_fit_footprint_gt$fitted.values))
+(cor(capacity_pred))^2
+```
+
+Plot:
+```{r}
+ggplot(capacity_pred,
+       aes(x = capacity, y = capacity_pred)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1)
+```
+
+#---
+
+Now let's took a look at location.. Maybe there's a relationship between capacity and if the schools is suburban or urban. 
+
+We will find the distance from each school (School_Profile_u) to the lat-long coordinate of "King St W and James St S: (43.256684, -79.869039). We will assume all schools within 7km of the spot are "urban" and code them as 1. 
+```{r}
+urban_pt <- st_sfc(st_point(c(-79.869039, 43.256684)), crs=4326 )
+DSB_1011_Comp_WSG84 <- st_transform(DSB_1011_Comp, crs=4326)
+DSB_1011_Comp$urban.dist <- st_distance(DSB_1011_Comp_WSG84, y = urban_pt)
+DSB_1011_Comp$urban.dummy <- ifelse(as.numeric(DSB_1011_Comp$urban.dist) > 7000, 1, 0)
+```
+
+
+Next we will re-import School_Profile, and make necessary changes. 
+```{r}
+School_Profiles <- read.csv("School-Profiles.csv")
+School_Profiles_u <- School_Profiles %>%
+  rename(area = `Building.Gross..Ft2.`) %>%
+  distinct(capacity, 
+           area, 
+           .keep_all = TRUE) # Keep all columns
+School_Profiles_u <- School_Profiles_u [ !(School_Profiles_u$school_name %in% "New Spencer Valley"),]
+School_Profiles_u <- School_Profiles_u [ !(School_Profiles_u$school_name %in% "Rockton Elementary"),]
+School_Profiles_u$area <- sub(",", "", School_Profiles_u$area) 
+School_Profiles_u$area <- as.numeric(as.character(School_Profiles_u$area))
+School_Profiles_u <- School_Profiles_u %>%
+    mutate(area = set_units(area, ft^2),
+         area = set_units(area, m^2))
+```
+
+Then we join the DSB_1011 table to the school profiles:
+```{r}
+School_Profiles_u <- School_Profiles_u %>%
+  left_join(DSB_1011_Comp, by = c("school_name" = "SCHNAME"))
+#summary(School_Profiles_u)
+```
+Good, only 1 footprint missing -> this is from Parkview, a secondary school which the original DSB points did not contain. 
+
+Here we will attach School Type and Grade as dummy variables, so we have all possible variable present:
+```{r}
+School_Profiles_u <- School_Profiles_u %>%
+  mutate(Type.Elementary = ifelse(Type == "Elementary", 1, 0),
+         Type.Secondary = ifelse(Type == "Secondary", 1, 0),
+         Grades.6to8 = ifelse(Grades == "(6-8)", 1, 0), #added this one
+         Grades.JKto5 = ifelse(Grades == "(JK-5)", 1,0), #and this one
+         Grades.JKto6 = ifelse(Grades == "(JK-6)", 1, 0),
+         Grades.JKto8 = ifelse(Grades == "(JK-8)", 1, 0),
+         Grades.9to12 = ifelse(Grades == "(9-12)", 1, 0))
+```
+
+Correlation:
+```{r}
+School_Profiles_u %>%
+  select(capacity,
+         area,
+         footprint,
+         urban.dist,
+         urban.dummy) %>%
+  drop_na() %>%
+  cor()
+```
+
+
+Now let's take a look at strictly Urban location + footprint it's impact:
+```{r}
+OTG_fit_footprint_urb <- lm(capacity ~ 0 + footprint + urban.dummy,
+                            data = School_Profiles_u %>% 
+                drop_na(footprint))
+summary(OTG_fit_footprint_urb)
+```
+
+Plot and Residuals:
+```{r}
+data.frame(capacity = OTG_fit_footprint_urb$model$capacity, 
+           capacity_pred =OTG_fit_footprint_urb$fitted.values) %>%
+  ggplot(aes(x = capacity, y = capacity_pred,
+             label=sprintf("%0.0f", OTG_fit_footprint_urb$model$urban.dummy))) +
+    geom_point(aes(color = OTG_fit_footprint_urb$model$urban.dummy)) +
+  geom_text(size = 3, hjust=0.5, vjust=-0.5) +
+  geom_abline(intercept = 0, slope = 1)
+```
+
+
+```{r}
+ggplot(data.frame(capacity = OTG_fit_footprint_urb$model$capacity, 
+                  capacity_pred = OTG_fit_footprint_urb$fitted.values, 
+                  Urban_Location = case_when(OTG_fit_footprint_urb$model$urban.dummy == 1 ~ "Urban")),
+       aes(x = capacity, y = capacity_pred, label=sprintf("%0.0f", OTG_fit_footprint_urb$model$urban.dummy))) +
+  geom_point(aes(color = Urban_Location)) + 
+  geom_text(size = 3, hjust=0.5, vjust=-0.5) +
+  geom_smooth(method = "lm")
+ggplot(data.frame(e = OTG_fit_footprint_urb$residuals, 
+                  capacity_pred = OTG_fit_footprint_urb$fitted.values, 
+                  Urban_Location = case_when(OTG_fit_footprint_urb$model$urban.dummy == 1 ~ "Urban")),
+       aes(x = capacity_pred, y = e)) +
+  geom_point(aes(color = Urban_Location)) + 
+  geom_smooth(method = "lm")
+```
+
+Try distance instead of a dummy variable:
+```{r}
+OTG_fit_footprint_g <- lm(capacity ~ 0 + footprint + Grades.JKto5 + Grades.JKto8 + Grades.9to12 + urban.dist, 
+                            data = School_Profiles_u %>% 
+                drop_na(footprint))
+summary(OTG_fit_footprint_g)
+#Grades.6to8
+#Grades.JKto6
+```
+
+Check the residuals of the last model:
+```{r}
+ggplot(data.frame(e = OTG_fit_footprint_g$residuals, 
+                  capacity_pred = OTG_fit_footprint_g$fitted.values, 
+                  Grades = case_when(OTG_fit_footprint_g$model$Grades.JKto5 == 1 ~ "(JKto5)",
+                                     OTG_fit_footprint_g$model$Grades.JKto8 == 1 ~ "(JKto8)",
+                                     OTG_fit_footprint_g$model$Grades.9to12 == 1 ~ "(9to12)")),
+       aes(x = capacity_pred, y = e)) +
+  geom_point(aes(color = Grades)) + 
+  geom_smooth(method = "lm")
+#OTG_fit_footprint_g$model$Grades.JKto6 == 1 ~ "(JKto6)",
+#OTG_fit_footprint_g$model$Grades.6to8 == 1 ~ "(6to8)",
+```
+
+Try distance instead of a dummy variable:
+```{r}
+OTG_fit_footprint_gt <- lm(log(capacity) ~ 0 + log(footprint) + Grades.JKto5 + Grades.JKto8 + Grades.9to12 + urban.dist, 
+                            data = School_Profiles_u %>% 
+                drop_na(footprint))
+summary(OTG_fit_footprint_gt)
+#Grades.6to8
+#Grades.JKto6
+```
+
+Check the residuals of the last model:
+```{r}
+ggplot(data.frame(e = OTG_fit_footprint_gt$residuals, 
+                  capacity_pred = OTG_fit_footprint_gt$fitted.values, 
+                  Grades = case_when(OTG_fit_footprint_gt$model$Grades.JKto5 == 1 ~ "(JKto5)",
+                                     OTG_fit_footprint_gt$model$Grades.JKto8 == 1 ~ "(JKto8)",
+                                     OTG_fit_footprint_gt$model$Grades.9to12 == 1 ~ "(9to12)")),
+       aes(x = capacity_pred, y = e)) +
+  geom_point(aes(color = Grades)) + 
+  geom_smooth(method = "lm")
+#OTG_fit_footprint_g$model$Grades.JKto6 == 1 ~ "(JKto6)",
+#OTG_fit_footprint_g$model$Grades.6to8 == 1 ~ "(6to8)",
+```
+
+Transform the predicted values back from their log transformation and check pseudo-R2:
+```{r}
+capacity_pred <- data.frame(capacity = exp(OTG_fit_footprint_gt$model$`log(capacity)`), 
+                            capacity_pred = exp(OTG_fit_footprint_gt$fitted.values))
+(cor(capacity_pred))^2
+```
+
+Plot:
+```{r}
+ggplot(capacity_pred,
+       aes(x = capacity, y = capacity_pred)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1)
+```
+
+#---
+
+Summary of two candidate models: (footprint + grades) and (footprint + grades + dist.urban)
+```{r}
+mod1 <- lm(capacity ~ 0 + footprint + Grades.JKto5 + Grades.JKto8 + Grades.9to12, 
+                            data = School_Profiles_u %>% 
+                drop_na(footprint))
+mod2 <- lm(capacity ~ 0 + footprint + Grades.JKto5 + Grades.JKto8 + Grades.9to12 + urban.dist, 
+                            data = School_Profiles_u %>% 
+                drop_na(footprint))
+stargazer::stargazer(mod1, mod2, type = "text")
+```
+
+Check predictions:
+```{r}
+capacity_pred <- data.frame(capacity = mod2$model$capacity, 
+                            capacity_pred = mod2$fitted.values)
+(cor(capacity_pred))^2
+```
+
+Plot:
+```{r}
+ggplot(capacity_pred,
+       aes(x = capacity, y = capacity_pred)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1, linetype = "dotted", color = "gray20")
+```
+
+Notice that this model, although better in general, can give negative predictions.
+
+Summary of two candidate models: (footprint + grades) and (footprint + grades + dist.urban) with variable transformations:
+```{r}
+mod3 <- lm(log(capacity) ~ 0 + log(footprint) + Grades.JKto5 + Grades.JKto8 + Grades.9to12, 
+                            data = School_Profiles_u %>% 
+                drop_na(footprint))
+mod4 <- lm(log(capacity) ~ 0 + log(footprint) + Type.Elementary + Type.Secondary + urban.dist, 
+                            data = School_Profiles_u %>% 
+                drop_na(footprint))
+mod5 <- lm(log(capacity) ~ 0 + log(footprint) + Grades.JKto5_6 + Grades.JKto8 + Grades.9to12 + urban.dist, 
+                            data = School_Profiles_u %>% 
+                drop_na(footprint))
+stargazer::stargazer(mod4, mod5, type = "text")
+```
+
+Check predictions:
+```{r}
+capacity_pred_t <- data.frame(capacity = exp(mod4$model$`log(capacity)`), 
+                            capacity_pred = exp(mod4$fitted.values))
+(cor(capacity_pred_t))^2
+```
+
+Plot:
+```{r}
+ggplot(capacity_pred_t,
+       aes(x = capacity, y = capacity_pred)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1)
+```
+
+Plot predictions side by side:
+```{r}
+rbind(data.frame(capacity_pred, Model = "Model 2"),
+      data.frame(capacity_pred_t, Model = "Model 4")) %>%
+  ggplot(aes(x = capacity, y = capacity_pred)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1) +
+  facet_wrap(~ Model)
+```
+```{r}
+rbind(data.frame(capacity_pred, Model = "Model 2"),
+      data.frame(capacity_pred_t, Model = "Model 4")) %>%
+  ggplot(aes(x = capacity, y = capacity_pred)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1) +
+  facet_wrap(~ Model)
+```
+
+Question - is log transform just to avoid negative results? I assume yes.
+
+A thought, let's check the school sample to make sure it compares to the full school population. I'm afraid that the schools which have information profiles (and thus capacities) are different than the schools which we don't hav einformaiton on. 
+
+```{r}
+#DSB_1011_Comp_u <- merge(data.frame(DSB_1011_Comp), School_Profiles_u, by.x=c("SCHNAME"), by.y=c("school_name"), all.x = TRUE, all.y = TRUE)
+```
+
+Drop all which are NULL for capacity in DSB_1011_Comp_u and compare the remaining records to all those in School_Profiles
+```{r}
+#DSB_1011_Comp_wo_u <- DSB_1011_Comp_u[is.na(DSB_1011_Comp_u$capacity),]
+#plot(density(DSB_1011_Comp_wo_u$footprint.x))
+#plot(density(School_Profiles_u$footprint, na.rm = TRUE))
+#plot(density(DSB_1011_Comp_u$footprint.x, na.rm = TRUE))
+```
+
+
+```{r}
+#t.test(drop_units(DSB_1011_Comp_wo_u$footprint.x),drop_units(School_Profiles_u$footprint), var.equal=TRUE)
+```
+#---
+
+Regardless of these t-test results, we will go with the regression model (mod5).
+
+For reference this is the model:
+mod5 <- lm(log(capacity) ~ 0 + log(footprint) + Grades.JKto5_6 + Grades.JKto8 + Grades.9to12 + urban.dist, 
+                            data = School_Profiles_u %>% 
+                drop_na(footprint))
+
+The point data has fields corresponding to grades following this code:
+ELEM = JKto5 or JKto6 (i.e. Grades.JKto5_6)
+ELEM + MID = JKto8 (i.e. Grades.JKto8)
+MID = 6to8 -> not used
+HIGH = 9to12 (i.e. Grades.9to12)
+
+The model only takes (ELEM = JKto5, we'll assume JKto6 included)
+
+
+Let's populate the remaining OTGC in all four school point objects.
+
+First, import the rest of the school points:
+```{r}
+load("CDSB_1011_Comp.RData")
+load("DSB_1516_Comp.RData")
+load("CDSB_1516_Comp.RData")
+```
+
+Calculate the urban.dist field for all school points:
+```{r}
+urban_pt <- st_sfc(st_point(c(-79.869039, 43.256684)), crs=4326 )
+DSB_1516_Comp_WSG84 <- st_transform(DSB_1516_Comp, crs=4326)
+DSB_1516_Comp$urban.dist <- st_distance(DSB_1516_Comp_WSG84, y = urban_pt)
+CDSB_1011_Comp_WSG84 <- st_transform(CDSB_1011_Comp, crs=4326)
+CDSB_1011_Comp$urban.dist <- st_distance(CDSB_1011_Comp_WSG84, y = urban_pt)
+CDSB_1516_Comp_WSG84 <- st_transform(CDSB_1516_Comp, crs=4326)
+CDSB_1516_Comp$urban.dist <- st_distance(CDSB_1516_Comp_WSG84, y = urban_pt)
+```
+
+
+Now add dummy variables for the Grades in all four school point objects:
+```{r}
+#Fill in all the missing values with 0
+DSB_1011_Comp <- DSB_1011_Comp %>% 
+  mutate(ELEM = coalesce(ELEM, "0"),
+         MID = coalesce(MID, "0"),
+         HIGH = coalesce(HIGH, "0"))
+#Create dummy variables correspending to Grades
+DSB_1011_Comp$urban.dist <- drop_units(DSB_1011_Comp$urban.dist)
+  
+DSB_1011_OTGC <- DSB_1011_Comp %>%
+  mutate(Grades.JKto5_6 = ifelse((ELEM == "ELEM" & MID == "0" & HIGH == "0"), 1, 0),
+         Grades.JKto8 = ifelse((ELEM == "ELEM" & MID == "MID" & HIGH == "0") | (SchoolType == "Elementary" & ELEM == "0" & MID == "0" & HIGH == "0"), 1, 0),
+         Grades.6to8 = ifelse((ELEM == "0" & MID == "MID" & HIGH == "0"), 1, 0),
+         Grades.9to12 = ifelse((ELEM == "0" & MID == "0" & HIGH == "HIGH")|(SchoolType == "Secondary" & ELEM == "0" & MID == "0" & HIGH == "0"), 1, 0))
+#note: Grades.6to8 not used in prediction model
+```
+```{r}
+DSB_1011_OTGC$rowID <- 1:nrow(DSB_1011_OTGC)
+```
+
+
+repeat the process but for all school points:
+```{r}
+DSB_1516_OTGC <- DSB_1516_Comp %>%
+  mutate(Grades.JKto5_6 = ifelse((Grades == "JK-5" | Grades == "JK-6"), 1, 0),
+         Grades.JKto8 = ifelse((Grades == "JK-8"|Grades == "1 to 8"), 1, 0),
+         Grades.6to8 = ifelse((Grades == "6 to 8" | Grades == "7 to 8" ), 1, 0),
+         Grades.9to12 = ifelse((Grades == "9 to 12"), 1, 0))
+#GRADE field is fully populated and recorresponds to ELEM and HIGH fields
+CDSB_1011_OTGC <- CDSB_1011_Comp %>% 
+  mutate(Grades.JKto8 = ifelse(GRADE == "Elementary", 1, 0),
+         Grades.9to12 = ifelse(GRADE == "Secondary", 1, 0))
+CDSB_1516_OTGC <- CDSB_1516_Comp %>%
+  mutate(Grades.JKto8 = ifelse(GRADE == "Elementary", 1, 0),
+         Grades.9to12 = ifelse(GRADE == "Secondary", 1, 0))
+```
+
+Now let's predict OTGC 
+```{r}
+mod_DSB_1011 <- lm(log(capacity) ~ 0 + log(footprint) + Grades.JKto5_6 + Grades.JKto8 + Grades.9to12 + urban.dist, data = School_Profiles_u)
+t <- data.frame(footprint = DSB_1011_OTGC$footprint, 
+           Grades.JKto5_6 = DSB_1011_OTGC$Grades.JKto5_6,
+           Grades.JKto8 =  DSB_1011_OTGC$Grades.JKto8,
+           Grades.9to12 = DSB_1011_OTGC$Grades.9to12,
+           urban.dist = DSB_1011_OTGC$urban.dist)
+t$urban.dist <- as.matrix(t$urban.dist)
+t2 <- predict(mod_DSB_1011, newdata = t)
+t2 <- data.frame(Cap.Output = t2,
+                 OTGC = exp(t2))
+t2$rowID <- 1:nrow(t2)
+t3 <- merge(DSB_1011_OTGC, t2, by= "rowID")
+```
+
+
+Now add in the available OTGC and a dummy variable indicating the OTGC source (SIP or will be predicted):
+```{r}
+School_Profiles_u_select <- School_Profiles_u %>%
+  select(school_name, capacity)
+t3 <- t3 %>%
+  left_join(School_Profiles_u_select, by = c("SCHNAME" = "school_name" ))
+```
+
+The predicted OTGC is similar enough to the capicities from the School Information Profiles, great!
+
+Let's predict OTGC for the other three School Points:
+```{r}
+```
+
+Now save all values to .RData
+```{r}
+```
