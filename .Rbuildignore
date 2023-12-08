@@ -7,3 +7,6 @@
 ^hamONdests\.Rproj$
 ^data-raw$
 ^\.github$
+^_pkgdown\.yml$
+^docs$
+^pkgdown$
